@@ -2,23 +2,28 @@ import logging
 import backoff
 from typing import Callable, Awaitable
 
+from homeassistant.core import callback
 from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.entity import Entity
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from custom_components.daikinone import DaikinOneData
 from custom_components.daikinone.const import DOMAIN, MANUFACTURER
+from custom_components.daikinone.coordinator import DaikinOneCoordinator
 from custom_components.daikinone.client.models import DaikinDevice, DaikinEquipment, DaikinThermostat
 
 log = logging.getLogger(__name__)
 
 
-class DaikinOneEntity[D: DaikinDevice](Entity):
+class DaikinOneEntity[D: DaikinDevice](CoordinatorEntity[DaikinOneCoordinator]):
+    """Base entity. State comes from the shared coordinator; entities never poll on their own."""
+
     _device: D
     _data: DaikinOneData
 
     _updates_paused: bool = False
 
     def __init__(self, data: DaikinOneData, device: D):
+        super().__init__(data.coordinator)
         self._data = data
         self._device = device
         self._attr_device_info = self.get_device_info()
@@ -61,33 +66,46 @@ class DaikinOneEntity[D: DaikinDevice](Entity):
             case _:
                 return None
 
-    async def async_get_device(self) -> D:
-        """Get the latest state of the sensor."""
-        raise NotImplementedError("DaikinOneEntity subclass has not implemented async_get_device")
+    def get_device(self) -> D:
+        """Look up this entity's device in the client's cache. Raises KeyError if it is missing."""
+        raise NotImplementedError("DaikinOneEntity subclass has not implemented get_device")
 
     def update_entity_attributes(self) -> None:
         """Update the entity attributes. When this is called, the device has already been updated."""
         raise NotImplementedError("DaikinOneEntity subclass has not implemented update_entity_attributes")
 
-    async def async_update(self, no_throttle: bool = False) -> None:
-        """Gets the latest state of the entity."""
-        if self._updates_paused:
-            return
-
-        log.debug("Updating daikinone entity %s for device %s", self.unique_id, self._device.id)
-        await self._data.update(no_throttle=no_throttle)
+    def refresh_from_cache(self) -> None:
+        """Reload this entity's device from the client's cache and recompute its attributes."""
         try:
-            self._device = await self.async_get_device()
+            self._device = self.get_device()
         except KeyError:
-            # Backing device missing from the cache this refresh (e.g. equipment skipped
-            # due to garbage identity strings). Mark unavailable and retain the last-known
-            # _device so attributes recover cleanly on the next successful refresh.
-            log.debug("Device %s missing this refresh, marking entity unavailable", self._device.id)
+            # Backing device missing from the latest fetch (e.g. equipment skipped due to garbage
+            # identity strings). Mark unavailable and retain the last-known _device so attributes
+            # recover cleanly on the next successful fetch.
+            log.debug("Device %s missing from the latest fetch, marking entity unavailable", self._device.id)
             self._attr_available = False
             return
 
         self._attr_available = True
         self.update_entity_attributes()
+
+    @property
+    def available(self) -> bool:
+        # CoordinatorEntity only checks the last fetch; also honor this entity's own state
+        # (device missing from the payload, or an offline thermostat for the climate entity)
+        return self._attr_available and super().available
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self.refresh_from_cache()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        # an optimistic write is waiting for the cloud to confirm it; a poll could carry older data
+        if self._updates_paused:
+            return
+        self.refresh_from_cache()
+        self.async_write_ha_state()
 
     async def update_state_optimistically(
         self,
@@ -97,8 +115,8 @@ class DaikinOneEntity[D: DaikinDevice](Entity):
     ) -> None:
         """
         Executes the given state update optimistically, then waits for the API to update the state as well. Regularly
-        scheduled updates are paused while waiting to avoid overwriting the optimistic update with stale data. A full
-        entity update is scheduled at the end regardless of whether updated remote state was found or not.
+        scheduled updates are paused while waiting to avoid overwriting the optimistic update with stale data. On
+        success, the latest fetched state is pushed to every entity through the coordinator.
         """
         # pause entity updates
         self._updates_paused = True
@@ -119,9 +137,8 @@ class DaikinOneEntity[D: DaikinDevice](Entity):
             # error doesn't permanently freeze this entity until the integration is reloaded
             self._updates_paused = False
 
-        # full entity update to make sure everything is in sync
-        await self.async_update(no_throttle=True)
-        self.async_write_ha_state()
+        # share the freshly fetched state with every entity; this also restarts the poll timer
+        self.coordinator.async_set_updated_data(self._data.daikin.get_thermostats())
 
     @backoff.on_predicate(
         backoff.constant,
@@ -139,7 +156,7 @@ class DaikinOneEntity[D: DaikinDevice](Entity):
         """
 
         # fetch the latest from the api
-        await self._data.update(no_throttle=True)
+        await self._data.daikin.update()
 
         # check if the value has been updated to the expected value
-        return check(await self.async_get_device())
+        return check(self.get_device())

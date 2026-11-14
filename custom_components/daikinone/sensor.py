@@ -903,7 +903,7 @@ async def async_setup_entry(
                 case _:
                     log.warning(f"unexpected equipment: {equipment}")
 
-    async_add_entities(entities, True)
+    async_add_entities(entities)
 
 
 class DaikinOneSensor[D: DaikinDevice](DaikinOneEntity[D], SensorEntity):
@@ -935,7 +935,7 @@ class DaikinOneThermostatSensor(DaikinOneSensor[DaikinThermostat]):
             case _:
                 raise ValueError("unexpected entity uid schema version")
 
-    async def async_get_device(self) -> DaikinThermostat:
+    def get_device(self) -> DaikinThermostat:
         return self._data.daikin.get_thermostat(self._device.id)
 
     def update_entity_attributes(self) -> None:
@@ -956,7 +956,7 @@ class DaikinOneEquipmentSensor[E: DaikinEquipment](DaikinOneSensor[E]):
             case _:
                 raise ValueError("unexpected entity uid schema version")
 
-    async def async_get_device(self) -> E:
+    def get_device(self) -> E:
         thermostat = self._data.daikin.get_thermostat(self._device.thermostat_id)
         # TODO: look at this type issue more later
         return thermostat.equipment[self._device.id]  # ty: ignore[invalid-return-type]

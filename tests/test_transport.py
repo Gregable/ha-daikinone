@@ -1,9 +1,12 @@
 import asyncio
+from unittest.mock import patch
 
+import aiohttp
 import pytest
 from aiohttp import ClientConnectionError
 from aioresponses import CallbackResult, aioresponses
 
+from custom_components.daikinone.client import transport as transport_module
 from custom_components.daikinone.client.models import DaikinUserCredentials
 from custom_components.daikinone.client.transport import DaikinTransport
 from custom_components.daikinone.client.wire import (
@@ -360,3 +363,24 @@ class TestRequestAuthRecovery:
 
         assert refresh_calls == 1
         assert all(r == [{"a": 1}] for r in results)
+
+
+class TestRequestTimeout:
+    async def test_every_session_has_a_bounded_timeout(self, mock_api: aioresponses) -> None:
+        """Regression test: sessions used aiohttp's 5-minute default, so one unanswered request
+        could hold an update open for minutes."""
+        mock_api.post(DAIKIN_API_URL_LOGIN, payload={"accessToken": "a", "refreshToken": "r"})
+        mock_api.get(DAIKIN_API_URL_DEVICE_DATA, payload=[])
+
+        timeouts = []
+        real_session = aiohttp.ClientSession
+
+        def recording_session(*args, **kwargs):
+            timeouts.append(kwargs.get("timeout"))
+            return real_session(*args, **kwargs)
+
+        with patch.object(transport_module.aiohttp, "ClientSession", side_effect=recording_session):
+            await _transport().request(DAIKIN_API_URL_DEVICE_DATA)
+
+        assert len(timeouts) == 2
+        assert all(t is not None and t.total is not None and t.total <= 30 for t in timeouts)

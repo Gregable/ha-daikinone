@@ -29,6 +29,9 @@ _AUTH_FAILURE_STATUSES = frozenset({401, 403})
 # response that's simply missing a field, which is handled separately via dict.get().
 _AUTH_TRANSPORT_ERRORS = (ClientError, TimeoutError, ValueError)
 
+# Bound every request; aiohttp's default allows 5 minutes per request.
+_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
+
 
 @dataclass
 class _AuthState:
@@ -57,10 +60,11 @@ class DaikinTransport:
         log.info("Logging in to Daikin API")
         try:
             async with aiohttp.ClientSession(
+                timeout=_REQUEST_TIMEOUT,
                 headers={
                     "Accept": "application/json",
                     "Content-Type": "application/json",
-                }
+                },
             ) as session:
                 async with session.post(
                     url=DAIKIN_API_URL_LOGIN,
@@ -136,10 +140,11 @@ class DaikinTransport:
         token = self._auth.access_token
         log.debug(f"Sending request to Daikin API: {method} {url}")
         async with aiohttp.ClientSession(
+            timeout=_REQUEST_TIMEOUT,
             headers={
                 "Accept": "application/json",
                 "Authorization": f"Bearer {token}",
-            }
+            },
         ) as session:
             async with session.request(method, url, json=body) as response:
                 log.debug(f"Got response: {response.status}")
@@ -206,7 +211,8 @@ class DaikinTransport:
         log.debug("Refreshing access token")
         try:
             async with aiohttp.ClientSession(
-                headers={"Accept": "application/json", "Content-Type": "application/json"}
+                timeout=_REQUEST_TIMEOUT,
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
             ) as session:
                 async with session.post(
                     url=DAIKIN_API_URL_REFRESH_TOKEN,

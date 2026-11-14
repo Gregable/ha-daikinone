@@ -25,10 +25,9 @@ log = logging.getLogger(__name__)
 class DaikinOne:
     """Manages connection to Daikin API and fetching device data."""
 
-    __thermostats: dict[str, DaikinThermostat] = dict()
-
     def __init__(self, creds: DaikinUserCredentials) -> None:
         self._transport = DaikinTransport(creds)
+        self.__thermostats: dict[str, DaikinThermostat] = {}
 
     async def login(self) -> bool:
         return await self._transport.login()
