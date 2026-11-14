@@ -4,38 +4,24 @@ from dataclasses import dataclass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.core import HomeAssistant
-from homeassistant.util import Throttle
 
 from custom_components.daikinone.const import (
     CONF_OPTION_ENTITY_UID_SCHEMA_VERSION_KEY,
     PLATFORMS,
     DOMAIN,
-    MIN_TIME_BETWEEN_UPDATES,
 )
 from custom_components.daikinone.client.client import DaikinOne
 from custom_components.daikinone.client.models import DaikinUserCredentials
+from custom_components.daikinone.coordinator import DaikinOneCoordinator
 
 log = logging.getLogger(__name__)
 
 
 @dataclass
 class DaikinOneData:
-    _hass: HomeAssistant
     entry: ConfigEntry
     daikin: DaikinOne
-
-    async def update(self, no_throttle: bool = False) -> None:
-        """Get the latest data from Daikin cloud"""
-        await self._update(no_throttle=no_throttle)
-
-    @Throttle(MIN_TIME_BETWEEN_UPDATES)
-    async def _update(self) -> None:
-        """
-        @Throttle throws off the type checker so use internal implementation that can be type ignored in one place
-        instead of everywhere that calls update
-        """
-        log.debug("Updating Daikin One data from cloud")
-        await self.daikin.update()
+    coordinator: DaikinOneCoordinator
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -43,12 +29,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     log.info(f"Setting up Daikin One integration for {entry.data[CONF_EMAIL]}")
 
-    # create daikin one connector
-    data = DaikinOneData(
-        hass, entry, DaikinOne(DaikinUserCredentials(entry.data[CONF_EMAIL], entry.data[CONF_PASSWORD]))
-    )
-    await data.update()
-    hass.data[DOMAIN] = data
+    daikin = DaikinOne(DaikinUserCredentials(entry.data[CONF_EMAIL], entry.data[CONF_PASSWORD]))
+    coordinator = DaikinOneCoordinator(hass, entry, daikin)
+
+    # raises ConfigEntryNotReady (HA retries setup) or ConfigEntryAuthFailed (HA asks the user to
+    # re-authenticate) instead of leaving the entry permanently failed until a manual reload
+    await coordinator.async_config_entry_first_refresh()
+
+    hass.data[DOMAIN] = DaikinOneData(entry, daikin, coordinator)
 
     # load platforms
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

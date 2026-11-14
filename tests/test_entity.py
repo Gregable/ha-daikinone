@@ -1,14 +1,16 @@
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.components.sensor import SensorEntityDescription
 
 from custom_components.daikinone import DaikinOneData
 from custom_components.daikinone.client.client import DaikinOne
-from custom_components.daikinone.client.models import DaikinIndoorUnit, DaikinUserCredentials
+from custom_components.daikinone.client.models import DaikinIndoorUnit, DaikinThermostat, DaikinUserCredentials
 from custom_components.daikinone.const import CONF_OPTION_ENTITY_UID_SCHEMA_VERSION_KEY
+from custom_components.daikinone.coordinator import DaikinOneCoordinator
+from custom_components.daikinone.entity import DaikinOneEntity
 from custom_components.daikinone.sensor import DaikinOneEquipmentSensor, DaikinOneThermostatSensor
 from tests.test_mapping import AIR_HANDLER_DATA, _make_device
 
@@ -23,8 +25,14 @@ def daikin_client() -> DaikinOne:
 
 @pytest.fixture
 def data(daikin_client: DaikinOne) -> DaikinOneData:
-    entry = SimpleNamespace(data={CONF_OPTION_ENTITY_UID_SCHEMA_VERSION_KEY: 1})
-    return DaikinOneData(_hass=None, entry=entry, daikin=daikin_client)  # type: ignore[arg-type]
+    entry = SimpleNamespace(
+        data={CONF_OPTION_ENTITY_UID_SCHEMA_VERSION_KEY: 1},
+        async_on_unload=MagicMock(),
+        title="Daikin One",
+        pref_disable_polling=False,
+    )
+    coordinator = DaikinOneCoordinator(MagicMock(), entry, daikin_client)  # type: ignore[arg-type]
+    return DaikinOneData(entry=entry, daikin=daikin_client, coordinator=coordinator)  # type: ignore[arg-type]
 
 
 def _power_description() -> SensorEntityDescription:
@@ -55,7 +63,7 @@ class TestEntityAvailability:
 
             bad_ah = {**AIR_HANDLER_DATA, "ctAHSerialNoCharacter1_15": "he\ufffdlo"}
             await _refresh(daikin_client, mock_req, _make_device(bad_ah))
-            await sensor.async_update(no_throttle=True)
+            sensor.refresh_from_cache()
 
         assert sensor.available is False
         # last-known _device is retained so attributes can recover cleanly
@@ -75,12 +83,12 @@ class TestEntityAvailability:
 
             bad_ah = {**AIR_HANDLER_DATA, "ctAHSerialNoCharacter1_15": "he\ufffdlo"}
             await _refresh(daikin_client, mock_req, _make_device(bad_ah))
-            await sensor.async_update(no_throttle=True)
+            sensor.refresh_from_cache()
             assert sensor.available is False
 
             recovered = {**AIR_HANDLER_DATA, "ctIndoorPower": 1230}
             await _refresh(daikin_client, mock_req, _make_device(recovered))
-            await sensor.async_update(no_throttle=True)
+            sensor.refresh_from_cache()
 
         assert sensor.available is True
         assert sensor._device.power_usage == 123.0
@@ -99,7 +107,162 @@ class TestEntityAvailability:
                 attribute=lambda t: t.indoor_humidity,
             )
 
-            await sensor.async_update(no_throttle=True)
+            sensor.refresh_from_cache()
 
         assert sensor.available is True
         assert sensor.native_value == 45
+
+
+class _StubEntity(DaikinOneEntity[DaikinThermostat]):
+    def get_device(self) -> DaikinThermostat:
+        return self._device
+
+    def update_entity_attributes(self) -> None:
+        pass
+
+
+class TestUpdateStateOptimistically:
+    async def test_updates_paused_reset_after_operation_error(
+        self, daikin_client: DaikinOne, data: DaikinOneData
+    ) -> None:
+        """Regression test: a failed operation must not permanently freeze the entity."""
+        with patch.object(daikin_client._transport, "request", new_callable=AsyncMock) as mock_req:
+            await _refresh(daikin_client, mock_req, _make_device(AIR_HANDLER_DATA))
+        thermostat = daikin_client.get_thermostats()["device123"]
+
+        entity = _StubEntity(data=data, device=thermostat)
+
+        async def failing_operation() -> None:
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError):
+            await entity.update_state_optimistically(
+                operation=failing_operation,
+                optimistic_update=lambda d: None,
+                check=lambda d: True,
+            )
+
+        assert entity._updates_paused is False
+
+    async def test_updates_resume_after_wait_for_updated_value_error(
+        self, daikin_client: DaikinOne, data: DaikinOneData
+    ) -> None:
+        """Regression test: a failed post-operation poll must not permanently freeze the entity."""
+        with patch.object(daikin_client._transport, "request", new_callable=AsyncMock) as mock_req:
+            await _refresh(daikin_client, mock_req, _make_device(AIR_HANDLER_DATA))
+        thermostat = daikin_client.get_thermostats()["device123"]
+
+        entity = _StubEntity(data=data, device=thermostat)
+        entity.hass = None  # type: ignore[assignment]
+        entity.entity_id = "climate.test"
+        entity.async_write_ha_state = lambda: None  # type: ignore[method-assign]
+
+        def check(_: DaikinThermostat) -> bool:
+            raise RuntimeError("device disappeared mid-poll")
+
+        with patch.object(daikin_client._transport, "request", new_callable=AsyncMock) as mock_req:
+            mock_req.return_value = [_make_device(AIR_HANDLER_DATA)]
+
+            with pytest.raises(RuntimeError):
+                await entity.update_state_optimistically(
+                    operation=AsyncMock(),
+                    optimistic_update=lambda d: None,
+                    check=check,
+                )
+
+        assert entity._updates_paused is False
+
+
+def _humidity_sensor(daikin_client: DaikinOne, data: DaikinOneData) -> DaikinOneThermostatSensor:
+    thermostat = daikin_client.get_thermostats()["device123"]
+    sensor = DaikinOneThermostatSensor(
+        description=_humidity_description(),
+        data=data,
+        device=thermostat,
+        attribute=lambda t: t.indoor_humidity,
+    )
+    sensor.hass = MagicMock()
+    sensor.entity_id = "sensor.test_humidity"
+    sensor.async_write_ha_state = MagicMock()  # type: ignore[method-assign]
+    return sensor
+
+
+class TestCoordinatorUpdates:
+    async def test_entities_do_not_poll(self, daikin_client: DaikinOne, data: DaikinOneData) -> None:
+        """Only the coordinator talks to the cloud; entities must not each start their own fetch."""
+        with patch.object(daikin_client._transport, "request", new_callable=AsyncMock) as mock_req:
+            await _refresh(daikin_client, mock_req, _make_device(AIR_HANDLER_DATA))
+
+        assert _humidity_sensor(daikin_client, data).should_poll is False
+
+    async def test_failed_fetch_marks_entities_unavailable(self, daikin_client: DaikinOne, data: DaikinOneData) -> None:
+        """Regression test: a failed or cancelled fetch left sensors showing their last value
+        indefinitely, indistinguishable from live data."""
+        with patch.object(daikin_client._transport, "request", new_callable=AsyncMock) as mock_req:
+            await _refresh(daikin_client, mock_req, _make_device(AIR_HANDLER_DATA))
+        sensor = _humidity_sensor(daikin_client, data)
+        sensor.refresh_from_cache()
+        assert sensor.available is True
+
+        data.coordinator.last_update_success = False
+
+        assert sensor.available is False
+
+    async def test_coordinator_update_refreshes_and_writes_state(
+        self, daikin_client: DaikinOne, data: DaikinOneData
+    ) -> None:
+        with patch.object(daikin_client._transport, "request", new_callable=AsyncMock) as mock_req:
+            await _refresh(daikin_client, mock_req, _make_device(AIR_HANDLER_DATA))
+            sensor = _humidity_sensor(daikin_client, data)
+            sensor.refresh_from_cache()
+
+            changed = _make_device(AIR_HANDLER_DATA)
+            changed["data"] = {**changed["data"], "humIndoor": 60}
+            await _refresh(daikin_client, mock_req, changed)
+
+        sensor._handle_coordinator_update()
+
+        assert sensor.native_value == 60
+        sensor.async_write_ha_state.assert_called_once()
+
+    async def test_coordinator_update_ignored_while_paused(self, daikin_client: DaikinOne, data: DaikinOneData) -> None:
+        """An optimistic write in progress must not be overwritten by a poll with older data."""
+        with patch.object(daikin_client._transport, "request", new_callable=AsyncMock) as mock_req:
+            await _refresh(daikin_client, mock_req, _make_device(AIR_HANDLER_DATA))
+            sensor = _humidity_sensor(daikin_client, data)
+            sensor.refresh_from_cache()
+
+            changed = _make_device(AIR_HANDLER_DATA)
+            changed["data"] = {**changed["data"], "humIndoor": 60}
+            await _refresh(daikin_client, mock_req, changed)
+
+        sensor._updates_paused = True
+        sensor._handle_coordinator_update()
+
+        assert sensor.native_value == 45
+        sensor.async_write_ha_state.assert_not_called()
+
+    async def test_optimistic_update_pushes_fresh_data_to_all_entities(
+        self, daikin_client: DaikinOne, data: DaikinOneData
+    ) -> None:
+        with patch.object(daikin_client._transport, "request", new_callable=AsyncMock) as mock_req:
+            await _refresh(daikin_client, mock_req, _make_device(AIR_HANDLER_DATA))
+        thermostat = daikin_client.get_thermostats()["device123"]
+        entity = _StubEntity(data=data, device=thermostat)
+        entity.hass = MagicMock()
+        entity.entity_id = "climate.test"
+        entity.async_write_ha_state = MagicMock()  # type: ignore[method-assign]
+
+        with (
+            patch.object(daikin_client._transport, "request", new_callable=AsyncMock) as mock_req,
+            patch.object(data.coordinator, "async_set_updated_data") as push,
+        ):
+            mock_req.return_value = [_make_device(AIR_HANDLER_DATA)]
+            await entity.update_state_optimistically(
+                operation=AsyncMock(),
+                optimistic_update=lambda d: None,
+                check=lambda d: True,
+            )
+
+        push.assert_called_once()
+        assert list(push.call_args.args[0]) == ["device123"]

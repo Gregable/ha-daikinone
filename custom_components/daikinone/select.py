@@ -35,7 +35,7 @@ async def async_setup_entry(
             )
         ]
 
-    async_add_entities(entities, True)
+    async_add_entities(entities)
 
 
 class DaikinOneFanSpeedSelect(DaikinOneEntity[DaikinThermostat], SelectEntity):
@@ -77,7 +77,7 @@ class DaikinOneFanSpeedSelect(DaikinOneEntity[DaikinThermostat], SelectEntity):
             check=lambda t: t.fan_speed == target_fan_speed,
         )
 
-    async def async_get_device(self) -> DaikinThermostat:
+    def get_device(self) -> DaikinThermostat:
         return self._data.daikin.get_thermostat(self._device.id)
 
     def update_entity_attributes(self) -> None:

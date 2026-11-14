@@ -49,7 +49,7 @@ async def async_setup_entry(
         for device in data.daikin.get_thermostats().values()
     ]
 
-    async_add_entities(entities, True)
+    async_add_entities(entities)
 
 
 class DaikinOneThermostatPresetMode(Enum):
@@ -286,7 +286,7 @@ class DaikinOneThermostat(DaikinOneEntity[DaikinThermostat], ClimateEntity):
             check=lambda t: t.fan_mode == target_fan_mode,
         )
 
-    async def async_get_device(self) -> DaikinThermostat:
+    def get_device(self) -> DaikinThermostat:
         return self._data.daikin.get_thermostat(self._device.id)
 
     def update_entity_attributes(self) -> None:
